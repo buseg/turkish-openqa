@@ -1,2 +1,6 @@
 # Ignore dataset folder
 odqa_data/
+checkpoint/
+# Ignore Python bytecode files
+__pycache__/
+*.pyc

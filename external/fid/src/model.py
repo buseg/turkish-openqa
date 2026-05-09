@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 import numpy as np
 
-class FiDT5(transformers.T5ForConditionalGeneration):
+class FiDT5(transformers.MT5ForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
         self.wrap_encoder()
@@ -28,7 +28,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         )
 
     # We need to resize as B x (N * L) instead of (B * N) x L here
-    # because the T5 forward method uses the input tensors to infer
+    # because the MT5 forward method uses the input tensors to infer
     # dimensions used in the decoder.
     # EncoderWrapper resizes the inputs as (B * N) x L.
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -56,13 +56,13 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
     def wrap_encoder(self, use_checkpoint=False):
         """
-        Wrap T5 encoder to obtain a Fusion-in-Decoder model.
+        Wrap MT5 encoder to obtain a Fusion-in-Decoder model.
         """
         self.encoder = EncoderWrapper(self.encoder, use_checkpoint=use_checkpoint)
 
     def unwrap_encoder(self):
         """
-        Unwrap Fusion-in-Decoder encoder, useful to load T5 weights.
+        Unwrap Fusion-in-Decoder encoder, useful to load MT5 weights.
         """
         self.encoder = self.encoder.encoder
         block = []
@@ -71,7 +71,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         block = nn.ModuleList(block)
         self.encoder.block = block
 
-    def load_t5(self, state_dict):
+    def load_MT5(self, state_dict):
         self.unwrap_encoder()
         self.load_state_dict(state_dict)
         self.wrap_encoder()
@@ -128,12 +128,13 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
 class EncoderWrapper(torch.nn.Module):
     """
-    Encoder Wrapper for T5 Wrapper to obtain a Fusion-in-Decoder model.
+    Encoder Wrapper for MT5 Wrapper to obtain a Fusion-in-Decoder model.
     """
     def __init__(self, encoder, use_checkpoint=False):
         super().__init__()
 
         self.encoder = encoder
+        self.main_input_name = getattr(encoder, "main_input_name", "input_ids")
         apply_checkpoint_wrapper(self.encoder, use_checkpoint)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs,):
@@ -143,7 +144,16 @@ class EncoderWrapper(torch.nn.Module):
         input_ids = input_ids.view(bsz*self.n_passages, passage_length)
         attention_mask = attention_mask.view(bsz*self.n_passages, passage_length)
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
-        outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
+
+        if isinstance(outputs, tuple):
+            outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
+        else:
+            last_hidden_state = outputs.last_hidden_state.view(bsz, self.n_passages*passage_length, -1)
+            outputs = outputs.__class__(
+                last_hidden_state=last_hidden_state,
+                hidden_states=getattr(outputs, 'hidden_states', None),
+                attentions=getattr(outputs, 'attentions', None),
+            )
         return outputs
 
 class CheckpointWrapper(torch.nn.Module):
@@ -156,7 +166,7 @@ class CheckpointWrapper(torch.nn.Module):
         self.module = module
         self.use_checkpoint = use_checkpoint
 
-    def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
+    def forward(self, *args, **kwargs):
         if self.use_checkpoint and self.training:
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             def custom_forward(*inputs):
@@ -171,25 +181,24 @@ class CheckpointWrapper(torch.nn.Module):
 
             output = torch.utils.checkpoint.checkpoint(
                 custom_forward,
-                hidden_states,
-                attention_mask,
-                position_bias
+                *args,
+                use_reentrant=True
             )
             output = tuple(x if x.size() != 0 else None for x in output)
         else:
-            output = self.module(hidden_states, attention_mask, position_bias, **kwargs)
+            output = self.module(*args, **kwargs)
         return output
 
-def apply_checkpoint_wrapper(t5stack, use_checkpoint):
+def apply_checkpoint_wrapper(MT5stack, use_checkpoint):
     """
     Wrap each block of the encoder to enable checkpointing.
     """
     block = []
-    for mod in t5stack.block:
+    for mod in MT5stack.block:
         wrapped_mod = CheckpointWrapper(mod, use_checkpoint)
         block.append(wrapped_mod)
     block = nn.ModuleList(block)
-    t5stack.block = block
+    MT5stack.block = block
 
 def cross_attention_forward(
         self,

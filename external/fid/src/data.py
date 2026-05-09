@@ -73,12 +73,12 @@ class Dataset(torch.utils.data.Dataset):
 def encode_passages(batch_text_passages, tokenizer, max_length):
     passage_ids, passage_masks = [], []
     for k, text_passages in enumerate(batch_text_passages):
-        p = tokenizer.batch_encode_plus(
+        p = tokenizer(
             text_passages,
             max_length=max_length,
-            pad_to_max_length=True,
+            padding='max_length',
+            truncation=True,
             return_tensors='pt',
-            truncation=True
         )
         passage_ids.append(p['input_ids'][None])
         passage_masks.append(p['attention_mask'][None])
@@ -97,12 +97,12 @@ class Collator(object):
         assert(batch[0]['target'] != None)
         index = torch.tensor([ex['index'] for ex in batch])
         target = [ex['target'] for ex in batch]
-        target = self.tokenizer.batch_encode_plus(
+        target = self.tokenizer(
             target,
             max_length=self.answer_maxlength if self.answer_maxlength > 0 else None,
-            pad_to_max_length=True,
-            return_tensors='pt',
+            padding='max_length' if self.answer_maxlength > 0 else False,
             truncation=True if self.answer_maxlength > 0 else False,
+            return_tensors='pt',
         )
         target_ids = target["input_ids"]
         target_mask = target["attention_mask"].bool()
@@ -154,7 +154,7 @@ class RetrieverCollator(object):
         index = torch.tensor([ex['index'] for ex in batch])
 
         question = [ex['question'] for ex in batch]
-        question = self.tokenizer.batch_encode_plus(
+        question = self.tokenizer(
             question,
             pad_to_max_length=True,
             return_tensors="pt",
@@ -204,7 +204,7 @@ class TextCollator(object):
 
     def __call__(self, batch):
         index = [x[0] for x in batch]
-        encoded_batch = self.tokenizer.batch_encode_plus(
+        encoded_batch = self.tokenizer(
             [x[1] for x in batch],
             pad_to_max_length=True,
             return_tensors="pt",

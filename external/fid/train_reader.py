@@ -8,6 +8,7 @@ import time
 import sys
 import torch
 import transformers
+from transformers import AutoConfig, AutoTokenizer
 import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
@@ -18,13 +19,13 @@ import src.util
 import src.evaluation
 import src.data
 import src.model
-
+from torch.utils.tensorboard import SummaryWriter
 
 def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_em, checkpoint_path):
 
     if opt.is_main:
         try:
-            tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
+            tb_logger = SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
         except:
             tb_logger = None
             logger.warning('Tensorboard is not available.')
@@ -41,7 +42,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
     )
 
     loss, curr_loss = 0.0, 0.0
-    epoch = 1
+    epoch = 0
     model.train()
     while step < opt.total_steps:
         epoch += 1
@@ -65,9 +66,23 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
 
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
+            steps_since_eval = step % opt.eval_freq or opt.eval_freq
+
+            if opt.is_main and step % 50 == 0:
+                logger.info(
+                    f"Epoch {epoch} | "
+                    f"step {step} / {opt.total_steps} | "
+                    f"step_loss: {train_loss.item():.4f} | "
+                    f"avg_loss_since_eval: {curr_loss / steps_since_eval:.4f} | "
+                    f"lr: {scheduler.get_last_lr()[0]:.6f}"
+                )
+                if tb_logger is not None:
+                    tb_logger.add_scalar("Training/average_loss", curr_loss / steps_since_eval, step)
+                    tb_logger.add_scalar("Training/lr", scheduler.get_last_lr()[0], step)
+                    tb_logger.flush()
 
             if step % opt.eval_freq == 0:
-                dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
+                dev_em, logged_examples = evaluate(model, eval_dataset, tokenizer, collator, opt)
                 model.train()
                 if opt.is_main:
                     if dev_em > best_dev_em:
@@ -83,6 +98,25 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                         tb_logger.add_scalar("Evaluation", dev_em, step)
                         tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
                     curr_loss = 0.
+                
+                for ex_i, ex in enumerate(logged_examples):
+                    logger.info(
+                        f"\nValidation example {ex_i + 1}\n"
+                        f"Q: {ex['question']}\n"
+                        f"Pred: {ex['prediction']}\n"
+                        f"Gold: {ex['gold']}\n"
+                        f"EM: {ex['em']}\n"
+                    )
+
+                    if tb_logger is not None:
+                        tb_logger.add_text(
+                            f"Validation/example_{ex_i + 1}",
+                            f"**Q:** {ex['question']}\n\n"
+                            f"**Pred:** {ex['prediction']}\n\n"
+                            f"**Gold:** {ex['gold']}\n\n"
+                            f"**EM:** {ex['em']}",
+                            step,
+                        )
 
             if opt.is_main and step % opt.save_freq == 0:
                 src.util.save(model, optimizer, scheduler, step, best_dev_em,
@@ -90,7 +124,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             if step > opt.total_steps:
                 break
 
-def evaluate(model, dataset, tokenizer, collator, opt):
+def evaluate(model, dataset, tokenizer, collator, opt, log_examples=3):
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(dataset,
         sampler=sampler,
@@ -102,6 +136,7 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     model.eval()
     total = 0
     exactmatch = []
+    logged_examples = []
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
@@ -115,13 +150,24 @@ def evaluate(model, dataset, tokenizer, collator, opt):
 
             for k, o in enumerate(outputs):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
+                example = dataset.get_example(idx[k])
+
                 gold = dataset.get_example(idx[k])['answers']
                 score = src.evaluation.ems(ans, gold)
                 total += 1
                 exactmatch.append(score)
 
+                if len(logged_examples) < log_examples:
+                    logged_examples.append({
+                        "question": example.get("question", ""),
+                        "prediction": ans,
+                        "gold": gold,
+                        "em": score,
+                    })
+
+
     exactmatch, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
-    return exactmatch
+    return exactmatch, logged_examples
 
 if __name__ == "__main__":
     options = Options()
@@ -135,7 +181,7 @@ if __name__ == "__main__":
     src.slurm.init_signal_handler()
 
     checkpoint_path = Path(opt.checkpoint_dir)/opt.name
-    checkpoint_exists = checkpoint_path.exists()
+    checkpoint_exists = (checkpoint_path / 'checkpoint' / 'latest').exists()
     if opt.is_distributed:
         torch.distributed.barrier()
     checkpoint_path.mkdir(parents=True, exist_ok=True)
@@ -149,11 +195,11 @@ if __name__ == "__main__":
         checkpoint_path / 'run.log'
     )
 
-    model_name = 't5-' + opt.model_size
+    model_name = "fanjiang98/FSMODQA-100k"
     model_class = src.model.FiDT5
 
     #load data
-    tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     collator = src.data.Collator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
 
     # use golbal rank and world size to split the eval set on multiple gpus
@@ -172,9 +218,12 @@ if __name__ == "__main__":
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 
     if not checkpoint_exists and opt.model_path == "none":
-        t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
+        print(f"Initializing model from {model_name}")
+        t5_config = AutoConfig.from_pretrained(model_name)
+        t5_config.tie_word_embeddings = False
+        t5 = transformers.MT5ForConditionalGeneration.from_pretrained(model_name, config=t5_config)
         model = src.model.FiDT5(t5.config)
-        model.load_t5(t5.state_dict())
+        model.load_MT5(t5.state_dict())
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_em = 0, 0.0
@@ -189,6 +238,7 @@ if __name__ == "__main__":
         logger.info(f"Model loaded from {opt.model_path}")
 
     model.set_checkpoint(opt.use_checkpoint)
+    print("Model loaded. Starting training.")
 
     if opt.is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
