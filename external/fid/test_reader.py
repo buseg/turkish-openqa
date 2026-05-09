@@ -29,6 +29,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         model.reset_score_storage() 
     total = 0
     exactmatch = []
+    f1 = []
     if opt.write_results:
         write_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
         fw = open(write_path / ('%d.txt'%opt.global_rank), 'a')
@@ -40,20 +41,20 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 model.reset_score_storage()
 
             outputs = model.generate(
-                input_ids=context_ids.cuda(),
-                attention_mask=context_mask.cuda(),
+                input_ids=context_ids.to(opt.device),
+                attention_mask=context_mask.to(opt.device),
                 max_length=50,
             )
 
             if opt.write_crossattention_scores:
-                crossattention_scores = model.get_crossattention_scores(context_mask.cuda())
+                crossattention_scores = model.get_crossattention_scores(context_mask.to(opt.device))
 
             for k, o in enumerate(outputs):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
                 example = dataset.data[idx[k]]
                 if 'answers' in example:
-                    score = src.evaluation.ems(ans, example['answers'])
-                    exactmatch.append(score)
+                    exactmatch.append(src.evaluation.ems(ans, example['answers']))
+                    f1.append(src.evaluation.f1s(ans, example['answers']))
 
                 if opt.write_results:
                     fw.write(str(example['id']) + "\t" + ans + '\n')
@@ -67,15 +68,16 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 if len(exactmatch) == 0:
                     log += '| no answer to compute scores'
                 else:
-                    log += f' | average = {np.mean(exactmatch):.3f}'
+                    log += f' | EM = {np.mean(exactmatch):.3f} | F1 = {np.mean(f1):.3f}'
                 logger.warning(log)
 
-    logger.warning(f'Process rank:{opt.global_rank}, total {total} | average = {np.mean(exactmatch):.3f}')
+    logger.warning(f'Process rank:{opt.global_rank}, total {total} | EM = {np.mean(exactmatch):.3f} | F1 = {np.mean(f1):.3f}')
     if opt.is_distributed:
         torch.distributed.barrier()
-    score, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
+    em_score, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
+    f1_score, _ = src.util.weighted_average(np.mean(f1), total, opt)
     
-    return score, total
+    return em_score, f1_score, total
 
 
 if __name__ == "__main__":
@@ -126,9 +128,9 @@ if __name__ == "__main__":
     model = model.to(opt.device)
 
     logger.info("Start eval")
-    exactmatch, total = evaluate(model, eval_dataset, eval_dataloader, tokenizer, opt)
+    exactmatch, f1, total = evaluate(model, eval_dataset, eval_dataloader, tokenizer, opt)
 
-    logger.info(f'EM {100*exactmatch:.2f}, Total number of example {total}')
+    logger.info(f'EM {100*exactmatch:.2f}, F1 {100*f1:.2f}, Total number of example {total}')
 
     if opt.write_results and opt.is_main:
         glob_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
@@ -136,4 +138,3 @@ if __name__ == "__main__":
         src.util.write_output(glob_path, write_path) 
     if opt.write_crossattention_scores:
         src.util.save_distributed_dataset(eval_dataset.data, opt)
-

@@ -50,9 +50,9 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             (idx, labels, _, context_ids, context_mask) = batch
 
             train_loss = model(
-                input_ids=context_ids.cuda(),
-                attention_mask=context_mask.cuda(),
-                labels=labels.cuda()
+                input_ids=context_ids.to(opt.device),
+                attention_mask=context_mask.to(opt.device),
+                labels=labels.to(opt.device)
             )[0]
 
             train_loss.backward()
@@ -67,7 +67,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             curr_loss += train_loss.item()
 
             if step % opt.eval_freq == 0:
-                dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
+                dev_em, dev_f1 = evaluate(model, eval_dataset, tokenizer, collator, opt)
                 model.train()
                 if opt.is_main:
                     if dev_em > best_dev_em:
@@ -76,7 +76,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                                   opt, checkpoint_path, 'best_dev')
                     log = f"{step} / {opt.total_steps} |"
                     log += f"train: {curr_loss/opt.eval_freq:.3f} |"
-                    log += f"evaluation: {100*dev_em:.2f}EM |"
+                    log += f"evaluation: {100*dev_em:.2f}EM / {100*dev_f1:.2f}F1 |"
                     log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
                     logger.info(log)    
                     if tb_logger is not None:
@@ -102,26 +102,28 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     model.eval()
     total = 0
     exactmatch = []
+    f1 = []
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             (idx, _, _, context_ids, context_mask) = batch
 
             outputs = model.generate(
-                input_ids=context_ids.cuda(),
-                attention_mask=context_mask.cuda(),
+                input_ids=context_ids.to(opt.device),
+                attention_mask=context_mask.to(opt.device),
                 max_length=50
             )
 
             for k, o in enumerate(outputs):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
                 gold = dataset.get_example(idx[k])['answers']
-                score = src.evaluation.ems(ans, gold)
                 total += 1
-                exactmatch.append(score)
+                exactmatch.append(src.evaluation.ems(ans, gold))
+                f1.append(src.evaluation.f1s(ans, gold))
 
     exactmatch, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
-    return exactmatch
+    f1, _ = src.util.weighted_average(np.mean(f1), total, opt)
+    return exactmatch, f1
 
 if __name__ == "__main__":
     options = Options()
@@ -175,7 +177,8 @@ if __name__ == "__main__":
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         model = src.model.FiDT5(t5.config)
         model.load_t5(t5.state_dict())
-        model = model.to(opt.local_rank)
+        # move model to the configured device (CPU or GPU)
+        model = model.to(opt.device)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_em = 0, 0.0
     elif opt.model_path == "none":

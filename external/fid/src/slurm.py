@@ -122,8 +122,13 @@ def init_distributed_mode(params):
         params.node_id = 0
         params.local_rank = 0
         params.global_rank = 0
-        params.world_size = n_gpu
-        params.n_gpu_per_node = n_gpu
+        # If no GPUs available (CPU-only), treat as single-process CPU run
+        if n_gpu == 0:
+            params.world_size = 1
+            params.n_gpu_per_node = 1
+        else:
+            params.world_size = n_gpu
+            params.n_gpu_per_node = n_gpu
         params.is_distributed = False
 
     # define whether this is the master process / if we are in distributed mode

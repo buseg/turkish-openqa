@@ -1,2 +1,10 @@
 # Ignore dataset folder
 odqa_data/
+data/*
+!data/
+!data/.gitkeep
+.hf_cache/
+checkpoints/
+__pycache__/
+*.py[cod]
+example.txt
