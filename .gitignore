@@ -1,2 +1,5 @@
 # Ignore dataset folder
 odqa_data/
+checkpoint/
+#Ignore python cache files
+__pycache__/
