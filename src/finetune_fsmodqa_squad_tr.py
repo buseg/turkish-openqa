@@ -151,6 +151,8 @@ def _native_train(args: argparse.Namespace) -> None:
         args.corpus_file,
         "--query_file",
         "train.query.jsonl",
+        "--eval_query_file",
+        "validation.query.jsonl",
         "--load_corpus",
         "True",
         "--train_n_passages",
@@ -246,7 +248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-train-epochs", type=float, default=2.0)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--distillation-start-steps", type=int, default=0)
-    parser.add_argument("--save-steps", type=int, default=1000000000)
+    parser.add_argument("--save-steps", type=int, default=1000)
     parser.add_argument("--print-steps", type=int, default=20)
     parser.add_argument("--tensorboard-log-dir", type=Path, default=None)
     parser.add_argument("--tb-log-examples", type=int, default=0)

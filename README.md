@@ -1,14 +1,34 @@
 # turkish-openqa
 
-First create the knowledge source and preprocess the Squad TR dataset with download_data.ipynb
+## Overview
 
-Then prepare retriever inputs with python src/prepare_fsmodqa_retrieval_inputs.py
+This repository contains the steps to prepare data, encode the corpus and queries, run retrieval and reader inference, evaluate results, and fine-tune FSMODQA on the Turkish SQuAD dataset.
 
+## Setup
+
+1. Create the knowledge source and preprocess the Squad TR. Use the odqa environment for the kernel and run the Jupyter Notebook `download_data.ipynb`:
+
+```bash
+conda env create -f fsmodqa_environment.yml
+```
+
+2. Prepare retriever inputs:
+
+```bash
+python src/prepare_fsmodqa_retrieval_inputs.py
+```
+
+## Encode the corpus
+
+Set up the fsmodqa_env
+```bash
 mkdir -p checkpoint/fsmodqa_off_the_shelf/encoding
 cd external/FSMODQA
-conda activate fsmodqa_env
+conda env create -f fsmodqa_environment.yml
+```
 
 Encode the corpus in 8 shards:
+```bash
 for i in 0 1 2 3 4 5 6 7; do
   CUDA_VISIBLE_DEVICES=0 python encode.py \
     --model_name_or_path fanjiang98/FSMODQA-100k \
@@ -24,11 +44,13 @@ for i in 0 1 2 3 4 5 6 7; do
     --dataloader_num_workers 4 \
     --tf32 True \
     --encoded_save_path ../../checkpoint/fsmodqa_off_the_shelf/encoding/passage_embedding_split${i}.pt
-done
 
+done
+```
 
 Encode SQUAD dataset queries:
 
+```bash
 CUDA_VISIBLE_DEVICES=1 python encode.py \
   --model_name_or_path fanjiang98/FSMODQA-100k \
   --output_dir ../../checkpoint/fsmodqa_off_the_shelf \
@@ -73,9 +95,13 @@ CUDA_VISIBLE_DEVICES=1 python encode.py \
   --dataloader_num_workers 4 \
   --tf32 True \
   --encoded_save_path ../../checkpoint/fsmodqa_off_the_shelf/encoding/test_query_embedding.pt
+```
 
+## Evaluating the Model
+Run FAISS GPU retrieval top-100:
 
-Then run FAISS GPU retrieval top-100:
+```bash
+cd external/FSMODQA
 
 CUDA_VISIBLE_DEVICES=0 python retriever.py \
   --query_embeddings ../../checkpoint/fsmodqa_off_the_shelf/encoding/validation_query_embedding.pt \
@@ -86,9 +112,11 @@ CUDA_VISIBLE_DEVICES=0 python retriever.py \
   --save_jsonl \
   --use_gpu \
   --save_ranking_to ../../checkpoint/fsmodqa_off_the_shelf/validation_top100
+```
 
-Now reader will run:
+Run the reader part with:
 
+```bash
 cd external/FSMODQA
 
 python test_reader.py \
@@ -110,9 +138,32 @@ python test_reader.py \
   --add_lang_token \
   --bf16 False \
   --tf32 True
+```
 
 Evaluate the results:
 
+```
 python src/evaluate.py \
   --predictions checkpoint/fsmodqa_off_the_shelf/validation_reader_predictions.json \
   --dataset odqa_data/squad_tr_processed_validation
+```
+
+## Finetuning
+
+To finetune the model from base model:
+
+  CUDA_VISIBLE_DEVICES=1 /cta/users/buse/miniconda3/envs/fsmodqa_env/bin/torchrun --nproc_per_node=1 \
+  src/finetune_fsmodqa_squad_tr.py \
+  --mode reader \
+  --skip-rankings \
+  --output-dir checkpoint/fsmodqa_squad_tr_reader \
+  --work-dir checkpoint/fsmodqa_squad_tr_reader/reader_finetuning_data \
+  --print-steps 100 \
+  --save-steps 500 \
+  --tb-metric-examples 500 \
+  --tb-log-examples 10 \
+  --tb-log-generation-steps 500 \
+  --tf32 \
+  --gradient-checkpointing \
+  --train-n-passages 25
+  --num-train-epochs 1.0

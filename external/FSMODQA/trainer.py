@@ -252,14 +252,9 @@ class ReaderTrainer(object):
             num_workers=0,
         )
 
-    def _log_tensorboard_generations(self, global_step):
-        if self.tb_writer is None or self.training_args.tb_log_examples <= 0:
-            return
-        if self.training_args.tb_log_generation_steps <= 0:
-            return
-        if global_step == 0 or global_step % self.training_args.tb_log_generation_steps != 0:
-            return
-
+    def _reader_validation_sample_scores(self, global_step=None, log_text=False):
+        if self.training_args.tb_metric_examples <= 0 and self.training_args.tb_log_examples <= 0:
+            return None
         model = self.model
         while hasattr(model, 'module'):
             model = model.module
@@ -267,7 +262,7 @@ class ReaderTrainer(object):
         was_training = model.training
         model.eval()
         rows = ["| qid | question | gold | prediction |", "| --- | --- | --- | --- |"]
-        text_examples_remaining = self.training_args.tb_log_examples
+        text_examples_remaining = self.training_args.tb_log_examples if log_text else 0
         old_n_passages = model.n_passages
         model.n_passages = self.data_args.train_n_passages
         em_scores = []
@@ -321,15 +316,30 @@ class ReaderTrainer(object):
                         )
                         text_examples_remaining -= 1
 
-            self.tb_writer.add_text("eval/example_generations", "\n".join(rows), global_step)
-            if em_scores:
-                self.tb_writer.add_scalar("eval_sample/em", mean(em_scores) * 100, global_step)
-                self.tb_writer.add_scalar("eval_sample/f1", mean(f1_scores) * 100, global_step)
-            self.tb_writer.flush()
+            scores = {
+                "em": mean(em_scores) * 100 if em_scores else 0.0,
+                "f1": mean(f1_scores) * 100 if f1_scores else 0.0,
+            }
+            if self.tb_writer is not None and global_step is not None:
+                if log_text:
+                    self.tb_writer.add_text("eval/example_generations", "\n".join(rows), global_step)
+                self.tb_writer.add_scalar("eval_sample/em", scores["em"], global_step)
+                self.tb_writer.add_scalar("eval_sample/f1", scores["f1"], global_step)
+                self.tb_writer.flush()
+            return scores
         finally:
             model.n_passages = old_n_passages
             if was_training:
                 model.train()
+
+    def _log_tensorboard_generations(self, global_step):
+        if self.tb_writer is None:
+            return
+        if self.training_args.tb_log_generation_steps <= 0:
+            return
+        if global_step == 0 or global_step % self.training_args.tb_log_generation_steps != 0:
+            return
+        self._reader_validation_sample_scores(global_step, log_text=self.training_args.tb_log_examples > 0)
 
     @staticmethod
     def _normalize_metric_text(text):
@@ -790,6 +800,7 @@ class ReaderTrainer(object):
     def train(self):
         global_step = 0
         prev_global_step = 0
+        prev_save_global_step = 0
         best_eval = 0.0
         if self.training_args.eval_at_start:
             eval_result = self.separate_joint_refresh_passages(do_eval=True, global_step=global_step)
@@ -898,10 +909,21 @@ class ReaderTrainer(object):
                             and self.training_args.process_index in [-1, 0]:
                         progress.display(step // self.training_args.gradient_accumulation_steps)
 
-                if global_step != 0 and global_step % self.training_args.save_steps == 0 and \
+                if global_step != 0 and global_step != prev_save_global_step and \
+                        global_step % self.training_args.save_steps == 0 and \
                         global_step > self.training_args.distillation_start_steps:
+                    prev_save_global_step = global_step
 
-                    if self.training_args.separate_joint_encoding:
+                    if self.training_args.only_reader:
+                        scores = self._reader_validation_sample_scores(global_step)
+                        if scores is None:
+                            logger.warning("Skipping checkpoint-best: no validation sample is configured.")
+                            eval_result = best_eval
+                        else:
+                            eval_result = scores["f1"]
+                            logger.info("Reader validation sample at step %s: F1 %.4f, EM %.4f",
+                                        global_step, scores["f1"], scores["em"])
+                    elif self.training_args.separate_joint_encoding:
                         eval_result = self.separate_joint_refresh_passages(do_eval=True, global_step=global_step)
                     else:
                         eval_result = self.refresh_passages(epoch=self.epoch + 1)
@@ -921,13 +943,13 @@ class ReaderTrainer(object):
                         output_dir = os.path.join(self.training_args.output_dir, checkpoint_folder)
                         self._save(self.model, output_dir)
                         self.tokenizer.save_pretrained(output_dir)
-                        shutil.copy2(os.path.join(self.training_args.output_dir, "dev_xor_retrieve_pids.jsonl"),
-                                     output_dir)
-                        if os.path.exists(os.path.join(self.training_args.output_dir,
-                                                       "dev_reader_xor_eng_span_predictions.json")):
-                            shutil.copy2(
-                                os.path.join(self.training_args.output_dir, "dev_reader_xor_eng_span_predictions.json"),
-                                output_dir)
+                        pids_path = os.path.join(self.training_args.output_dir, "dev_xor_retrieve_pids.jsonl")
+                        if os.path.exists(pids_path):
+                            shutil.copy2(pids_path, output_dir)
+                        predictions_path = os.path.join(
+                            self.training_args.output_dir, "dev_reader_xor_eng_span_predictions.json")
+                        if os.path.exists(predictions_path):
+                            shutil.copy2(predictions_path, output_dir)
                     if self.data_args.load_partial:
                         idx = global_step // self.training_args.save_steps
                         num_examples = 800 * self.training_args.save_steps
