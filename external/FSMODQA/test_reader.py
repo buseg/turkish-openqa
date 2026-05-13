@@ -96,7 +96,11 @@ def main():
     corpus = GenericDataLoader(data_dir, corpus_file=data_args.corpus_file).load_corpus()
     queries = GenericDataLoader(data_dir, query_file=data_args.query_file).load_queries()
 
-    output_path = os.path.join(model_args.model_name_or_path, data_args.output_path)
+    if os.path.isabs(data_args.output_path):
+        output_path = data_args.output_path
+    else:
+        output_path = os.path.join(training_args.output_dir, data_args.output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     eval_dataset = ReaderDataset(
         queries=queries,

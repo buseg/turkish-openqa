@@ -44,6 +44,8 @@ def main():
         num_labels=num_labels,
         cache_dir=model_args.cache_dir,
     )
+    if training_args.de_avg_pooling and hasattr(config, "retriever_head"):
+        delattr(config, "retriever_head")
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -82,9 +84,10 @@ def main():
                                    add_lang_token=data_args.add_lang_token,
                                    eval_mode=True,
                                    task=data_args.task)
+    eval_batch_size = training_args.per_device_eval_batch_size * max(1, training_args.n_gpu)
     encode_loader = DataLoader(
         encode_dataset,
-        batch_size=training_args.per_device_eval_batch_size * training_args.n_gpu,
+        batch_size=eval_batch_size,
         collate_fn=EncodeCollator(
             tokenizer,
             max_length=text_max_length,
@@ -137,6 +140,7 @@ def main():
                     encoded.append(passage_vector.cpu())
 
     encoded = torch.cat(encoded)
+    os.makedirs(os.path.dirname(data_args.encoded_save_path), exist_ok=True)
     torch.save((encoded, lookup_indices), data_args.encoded_save_path)
 
 
