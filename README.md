@@ -86,8 +86,6 @@ These proposal-aligned extensions remain future work:
 
 - DPR/ConvBERTurk retriever training over Turkish Wikipedia.
 - RL-based knowledge selector training.
-- Document rewriting after retrieval.
-- Synthetic Turkish QA data augmentation.
 - Refusal-aware reader training or prompting.
 - Larger full-dev reader runs for the strongest settings.
 
@@ -352,8 +350,6 @@ python scripts/apply_knowledge_selector.py \
 | Knowledge selector | Completed as supervised selector/reranker | Main experiment with no reader gain yet |
 | Cross-encoder reranker | Completed as pilot | Supporting probe |
 | FSMODQA dense retriever probe | Completed as pilot | Supporting probe |
-| Document rewriting | Future work | Not implemented |
-| Synthetic data augmentation | Future work | Not implemented |
 | RL-based selector training | Future work | Not implemented |
 
 ## Key Interpretation
@@ -367,4 +363,4 @@ The oracle top-5 result is important: it improves reader F1 from 15.17 to 19.31.
 - Reader ablations are 200-example answerable smoke/evidence checks, not full-dev reader inference.
 - The uploaded FSMODQA checkpoint did not work as a strong dense retriever in our small probe.
 - The current FSMODQA reader does not naturally refuse unanswerable questions.
-- DPR/ConvBERTurk retriever training, document rewriting, synthetic augmentation, and RL selector training are left as future work.
+- DPR/ConvBERTurk retriever training and RL selector training are left as future work.
