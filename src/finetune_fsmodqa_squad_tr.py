@@ -132,6 +132,10 @@ def _native_train(args: argparse.Namespace) -> None:
     _native_require_file(_native_ranking_path(args.work_dir, "train"), "train pids JSONL")
     _native_require_file(args.work_dir / "train.query.jsonl", "train query JSONL")
     _native_require_file(args.work_dir / args.corpus_file, "corpus JSONL")
+    model_name_or_path = args.model_name_or_path
+    local_model_path = ROOT / model_name_or_path
+    if not os.path.isabs(model_name_or_path) and local_model_path.exists():
+        model_name_or_path = str(local_model_path)
 
     command = [
         sys.executable,
@@ -140,9 +144,9 @@ def _native_train(args: argparse.Namespace) -> None:
         str(args.output_dir),
         "--overwrite_output_dir",
         "--model_name_or_path",
-        args.model_name_or_path,
+        model_name_or_path,
         "--task",
-        "XOR-Retrieve",
+        args.task,
         "--train_dir",
         str(args.work_dir),
         "--train_path",
@@ -167,6 +171,8 @@ def _native_train(args: argparse.Namespace) -> None:
         str(args.max_answer_length),
         "--per_device_train_batch_size",
         str(args.per_device_train_batch_size),
+        "--per_device_eval_batch_size",
+        str(args.per_device_eval_batch_size),
         "--gradient_accumulation_steps",
         str(args.gradient_accumulation_steps),
         "--learning_rate",
@@ -191,6 +197,9 @@ def _native_train(args: argparse.Namespace) -> None:
         str(args.tb_log_generation_steps),
         "--multi_task",
     ]
+    if args.local_retriever_eval:
+        command.extend(["--local_retriever_eval", "True"])
+        command.extend(["--local_retriever_eval_metric", args.local_retriever_eval_metric])
     if args.separate_joint_encoding:
         command.append("--separate_joint_encoding")
     if args.mode == "reader":
@@ -200,6 +209,8 @@ def _native_train(args: argparse.Namespace) -> None:
         command.extend(["--refresh_intervals", str(args.refresh_intervals)])
     if args.add_positive_passage:
         command.extend(["--add_positive_passage", "True"])
+    if args.de_avg_pooling:
+        command.append("--de_avg_pooling")
     if args.gradient_checkpointing:
         command.append("--gradient_checkpointing")
     if args.fp16:
@@ -224,6 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument("--mode", choices=("reader", "full"), default="reader")
+    parser.add_argument("--task", default=None, help="FSMODQA task name; defaults to the work-dir name.")
 
     parser.add_argument("--skip-rankings", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
@@ -243,6 +255,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-query-passage-length", type=int, default=250)
     parser.add_argument("--max-answer-length", type=int, default=50)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=512)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--num-train-epochs", type=float, default=2.0)
@@ -254,8 +267,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tb-log-examples", type=int, default=0)
     parser.add_argument("--tb-metric-examples", type=int, default=0)
     parser.add_argument("--tb-log-generation-steps", type=int, default=0)
+    parser.add_argument("--local-retriever-eval", action="store_true")
+    parser.add_argument("--local-retriever-eval-metric", default="hit@100")
     parser.add_argument("--separate-joint-encoding", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--add-positive-passage", action="store_true")
+    parser.add_argument("--de-avg-pooling", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true")
@@ -275,6 +291,8 @@ def main() -> None:
         args.work_dir = args.output_dir / "reader_finetuning_data"
     else:
         args.work_dir = _native_resolve(args.work_dir)
+    if args.task is None:
+        args.task = args.work_dir.name
     if args.cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
         print(f"Using CUDA_VISIBLE_DEVICES={args.cuda_visible_devices}")

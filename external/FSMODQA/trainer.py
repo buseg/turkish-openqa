@@ -169,6 +169,12 @@ class ReaderTrainer(object):
     def is_world_process_zero(self) -> bool:
         return self.training_args.process_index == 0
 
+    def _local_eval_files_exist(self) -> bool:
+        return (
+            os.path.exists(os.path.join(self.data_args.train_dir, self.data_args.corpus_file))
+            and os.path.exists(os.path.join(self.data_args.train_dir, self.data_args.eval_query_file))
+        )
+
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         if isinstance(data, Mapping):
             return type(data)({k: self._prepare_input(v) for k, v in data.items()})
@@ -338,6 +344,9 @@ class ReaderTrainer(object):
         if self.training_args.tb_log_generation_steps <= 0:
             return
         if global_step == 0 or global_step % self.training_args.tb_log_generation_steps != 0:
+            return
+        if self.training_args.save_steps > 0 and global_step % self.training_args.save_steps == 0 and \
+                global_step > self.training_args.distillation_start_steps:
             return
         self._reader_validation_sample_scores(global_step, log_text=self.training_args.tb_log_examples > 0)
 
@@ -800,6 +809,7 @@ class ReaderTrainer(object):
     def train(self):
         global_step = 0
         prev_global_step = 0
+        prev_refresh_global_step = 0
         prev_save_global_step = 0
         best_eval = 0.0
         if self.training_args.eval_at_start:
@@ -909,13 +919,25 @@ class ReaderTrainer(object):
                             and self.training_args.process_index in [-1, 0]:
                         progress.display(step // self.training_args.gradient_accumulation_steps)
 
+                if self.training_args.refresh_passages and global_step != 0 and \
+                        global_step != prev_refresh_global_step and global_step != self.max_step and \
+                        global_step % self.training_args.refresh_intervals == 0:
+                    prev_refresh_global_step = global_step
+                    if self.training_args.separate_joint_encoding:
+                        self.separate_joint_refresh_passages(do_eval=False, global_step=global_step)
+                    else:
+                        self.refresh_passages(epoch=self.epoch + 1)
+
                 if global_step != 0 and global_step != prev_save_global_step and \
                         global_step % self.training_args.save_steps == 0 and \
                         global_step > self.training_args.distillation_start_steps:
                     prev_save_global_step = global_step
 
                     if self.training_args.only_reader:
-                        scores = self._reader_validation_sample_scores(global_step)
+                        scores = self._reader_validation_sample_scores(
+                            global_step,
+                            log_text=self.training_args.tb_log_examples > 0,
+                        )
                         if scores is None:
                             logger.warning("Skipping checkpoint-best: no validation sample is configured.")
                             eval_result = best_eval
@@ -924,7 +946,39 @@ class ReaderTrainer(object):
                             logger.info("Reader validation sample at step %s: F1 %.4f, EM %.4f",
                                         global_step, scores["f1"], scores["em"])
                     elif self.training_args.separate_joint_encoding:
-                        eval_result = self.separate_joint_refresh_passages(do_eval=True, global_step=global_step)
+                        retriever_eval_result = None
+                        if self.training_args.local_retriever_eval and not self.training_args.refresh_passages:
+                            retriever_eval_result = self.local_retriever_validation(global_step=global_step)
+                        elif not self.training_args.local_retriever_eval:
+                            retriever_eval_result = self.separate_joint_refresh_passages(
+                                do_eval=True,
+                                global_step=global_step,
+                            )
+                        scores = self._reader_validation_sample_scores(
+                            global_step,
+                            log_text=self.training_args.tb_log_examples > 0,
+                        )
+                        if scores is None:
+                            if retriever_eval_result is None:
+                                eval_result = best_eval
+                                logger.warning(
+                                    "No validation sample configured and retriever eval is refresh-driven; "
+                                    "checkpoint-best is unchanged."
+                                )
+                            else:
+                                eval_result = retriever_eval_result
+                                logger.warning(
+                                    "No validation sample configured; checkpoint-best falls back to retriever metric."
+                                )
+                        else:
+                            eval_result = scores["f1"]
+                            logger.info(
+                                "Reader validation sample at step %s: F1 %.4f, EM %.4f "
+                                "(checkpoint-best selected by F1)",
+                                global_step,
+                                scores["f1"],
+                                scores["em"],
+                            )
                     else:
                         eval_result = self.refresh_passages(epoch=self.epoch + 1)
                     if isinstance(eval_result, tuple):
@@ -950,6 +1004,13 @@ class ReaderTrainer(object):
                             self.training_args.output_dir, "dev_reader_xor_eng_span_predictions.json")
                         if os.path.exists(predictions_path):
                             shutil.copy2(predictions_path, output_dir)
+                        for filename in [
+                            "validation_local_retriever_pids.jsonl",
+                            "validation_local_retriever_metrics.json",
+                        ]:
+                            local_eval_path = os.path.join(self.training_args.output_dir, filename)
+                            if os.path.exists(local_eval_path):
+                                shutil.copy2(local_eval_path, output_dir)
                     if self.data_args.load_partial:
                         idx = global_step // self.training_args.save_steps
                         num_examples = 800 * self.training_args.save_steps
@@ -958,13 +1019,6 @@ class ReaderTrainer(object):
                         with open(train_path) as f:
                             examples = [jsonline for jsonline in f.readlines()[idx * num_examples: (idx + 1) * num_examples]]
                         self.train_dataloader[0].dataset.examples = examples
-
-                if self.training_args.refresh_passages and global_step != 0 and global_step != self.max_step and \
-                        global_step % self.training_args.refresh_intervals == 0:
-                    if self.training_args.separate_joint_encoding:
-                        self.separate_joint_refresh_passages(do_eval=False, global_step=global_step)
-                    else:
-                        self.refresh_passages(epoch=self.epoch + 1)
 
                 if global_step >= self.max_step:
                     break
@@ -1148,7 +1202,9 @@ class ReaderTrainer(object):
         torch.save((encoded, lookup_indices), encoded_save_path)
 
     def separate_joint_refresh_passages(self, do_eval=True, eval_set="dev", global_step=0):
-        if not do_eval and self.training_args.use_mcontriever and global_step < self.training_args.self_retrieve_steps:
+        use_mcontriever = getattr(self.training_args, "use_mcontriever", False)
+        self_retrieve_steps = getattr(self.training_args, "self_retrieve_steps", 0)
+        if not do_eval and use_mcontriever and global_step < self_retrieve_steps:
             logger.info(f"Process {self.training_args.process_index} Loading updated training passages")
             with open(os.path.join(self.data_args.train_dir, "mss.ICL.train.jsonl"), 'r') as f:
                 examples = [json.loads(jsonline) for jsonline in f]
@@ -1174,7 +1230,15 @@ class ReaderTrainer(object):
             corpus = self.train_dataset[0].corpus
             train_dir = self.data_args.train_dir
 
-        results = self.separate_joint_encode(do_eval=do_eval, corpus=corpus, global_step=global_step)
+        results = self.separate_joint_encode(
+            do_eval=do_eval,
+            corpus=corpus,
+            global_step=global_step,
+            local_eval=(not do_eval and self.training_args.local_retriever_eval),
+        )
+        local_eval_results = None
+        if isinstance(results, tuple):
+            results, local_eval_results = results
         logger.info(f"Process {self.training_args.process_index} Done encoding")
 
         def save_results(results, output_path, add_score=True):
@@ -1198,6 +1262,12 @@ class ReaderTrainer(object):
                 output_path = os.path.join(self.training_args.output_dir,
                                            "train.split{}.jsonl".format(self.training_args.process_index))
                 save_results(results, output_path)
+                if local_eval_results is not None:
+                    output_path = os.path.join(
+                        self.training_args.output_dir,
+                        "validation_local_retriever.split{}.jsonl".format(self.training_args.process_index),
+                    )
+                    save_results(local_eval_results, output_path)
 
         torch.distributed.barrier()
 
@@ -1300,6 +1370,8 @@ class ReaderTrainer(object):
                     save_results(results, output_path, add_score=False)
 
         torch.distributed.barrier()
+        if local_eval_results is not None:
+            self.local_retriever_validation(global_step=global_step, reuse_existing=True)
         if not do_eval:
             logger.info(f"Process {self.training_args.process_index} Loading updated training passages")
             with open(os.path.join(self.training_args.output_dir, "train.jsonl"), 'r') as f:
@@ -1355,6 +1427,122 @@ class ReaderTrainer(object):
 
         self.model.train()
 
+        return eval_result
+
+    def local_retriever_validation(self, global_step=0, eval_set="validation", reuse_existing=False):
+        self.model.eval()
+        torch.cuda.empty_cache()
+
+        if not self._local_eval_files_exist():
+            raise FileNotFoundError(
+                "Local retriever eval requires "
+                f"{os.path.join(self.data_args.train_dir, self.data_args.corpus_file)} and "
+                f"{os.path.join(self.data_args.train_dir, self.data_args.eval_query_file)}"
+            )
+
+        if not reuse_existing:
+            if self.is_world_process_zero():
+                for path in glob.glob(os.path.join(self.training_args.output_dir,
+                                                   f"{eval_set}_local_retriever.split*.jsonl")):
+                    os.remove(path)
+            if dist.is_available() and dist.is_initialized():
+                torch.distributed.barrier()
+
+            corpus = self.train_dataset[0].corpus
+            results = self.separate_joint_encode(do_eval=True, corpus=corpus, global_step=global_step)
+            logger.info(f"Process {self.training_args.process_index} Done local retriever validation encoding")
+
+            split_path = os.path.join(
+                self.training_args.output_dir,
+                f"{eval_set}_local_retriever.split{self.training_args.process_index}.jsonl",
+            )
+            with open(split_path, "w") as f:
+                for qid in results:
+                    sorted_indices_scores = sorted(results[qid].items(), key=lambda x: x[1], reverse=True)[:100]
+                    example = {
+                        "qid": qid,
+                        "pids": [(docid, score) for docid, score in sorted_indices_scores],
+                    }
+                    f.write(json.dumps(example) + "\n")
+
+        if dist.is_available() and dist.is_initialized():
+            torch.distributed.barrier()
+
+        eval_result = 0.0
+        if self.is_world_process_zero():
+            merged = {}
+            for path in sorted(glob.glob(os.path.join(self.training_args.output_dir,
+                                                     f"{eval_set}_local_retriever.split*.jsonl"))):
+                with open(path) as f:
+                    for jsonline in f:
+                        example = json.loads(jsonline)
+                        merged.setdefault(example["qid"], {})
+                        for pid, score in example["pids"]:
+                            merged[example["qid"]][pid] = score
+
+            rows = []
+            pids_output_path = os.path.join(self.training_args.output_dir, f"{eval_set}_local_retriever_pids.jsonl")
+            with open(pids_output_path, "w") as f:
+                for qid in merged:
+                    sorted_indices_scores = sorted(merged[qid].items(), key=lambda x: x[1], reverse=True)[:100]
+                    pids = [docid for docid, _ in sorted_indices_scores]
+                    rows.append({"qid": qid, "pids": pids})
+                    f.write(json.dumps({"qid": qid, "pids": pids}) + "\n")
+
+            ranks = []
+            for row in rows:
+                qid = str(row["qid"])
+                rank = None
+                for idx, pid in enumerate(row["pids"], start=1):
+                    if str(pid).startswith(f"squad-{qid}-"):
+                        rank = idx
+                        break
+                ranks.append(rank)
+
+            metrics = {
+                "global_step": global_step,
+                "num_queries": len(ranks),
+                "num_found": sum(1 for rank in ranks if rank is not None),
+                "missed": sum(1 for rank in ranks if rank is None),
+                "mrr": mean((1.0 / rank) if rank is not None else 0.0 for rank in ranks) if ranks else 0.0,
+            }
+            for k in [1, 5, 10, 20, 50, 100]:
+                metrics[f"hit@{k}"] = (
+                    mean(1.0 if rank is not None and rank <= k else 0.0 for rank in ranks)
+                    if ranks else 0.0
+                )
+
+            metrics_path = os.path.join(
+                self.training_args.output_dir,
+                f"{eval_set}_local_retriever_metrics_step{global_step}.json",
+            )
+            with open(metrics_path, "w") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            with open(os.path.join(self.training_args.output_dir,
+                                   f"{eval_set}_local_retriever_metrics.json"), "w") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+            for key, value in metrics.items():
+                logger.info("Local retriever validation %s: %s", key, value)
+                if self.tb_writer is not None and isinstance(value, (int, float)):
+                    self.tb_writer.add_scalar(f"eval_retriever/{key}", value, global_step)
+            if self.tb_writer is not None:
+                self.tb_writer.flush()
+
+            eval_metric = self.training_args.local_retriever_eval_metric
+            if eval_metric not in metrics:
+                raise ValueError(
+                    f"Unknown local retriever eval metric {eval_metric!r}; "
+                    f"available metrics: {sorted(metrics)}"
+                )
+            eval_result = metrics[eval_metric]
+
+        if dist.is_available() and dist.is_initialized():
+            torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        self.model.train()
         return eval_result
 
     def eval_reader(self, corpus, eval_set="dev"):
@@ -1475,8 +1663,8 @@ class ReaderTrainer(object):
         mask = torch.cat(mask)
         return encoded, mask, lookup_indices
 
-    def separate_joint_encode(self, corpus, do_eval=True, global_step=0):
-        if self.data_args.query_file != "fs-qa.cl+il.llm-qa.jsonl" and global_step == 0 and \
+    def separate_joint_encode(self, corpus, do_eval=True, global_step=0, local_eval=False):
+        if not do_eval and self.data_args.query_file != "fs-qa.cl+il.llm-qa.jsonl" and global_step == 0 and \
                 os.path.exists(os.path.join(self.training_args.output_dir, "train.jsonl")):
             if self.data_args.query_file == "xor_nq_train_full.jsonl":
                 queries = GenericDataLoader(self.training_args.output_dir, corpus_file=self.data_args.corpus_file,
@@ -1486,7 +1674,9 @@ class ReaderTrainer(object):
             return
 
         if do_eval:
-            if ('nq-dpr' in self.data_args.train_dir or self.data_args.task not in self.data_args.train_dir) \
+            if self._local_eval_files_exist():
+                train_dir = self.data_args.train_dir
+            elif ('nq-dpr' in self.data_args.train_dir or self.data_args.task not in self.data_args.train_dir) \
                     and self.data_args.task != "MIRACL":
                 train_dir = 'data/XOR-Retrieve' if self.data_args.task == "XOR-Retrieve" \
                     else 'data/XOR-Full'
@@ -1538,12 +1728,25 @@ class ReaderTrainer(object):
                 assert len(queries) == 104486, len(queries)
                 self.train_dataloader[0].dataset.queries = queries
 
+        eval_queries = None
+        if local_eval:
+            assert not do_eval
+            eval_queries = GenericDataLoader(self.data_args.train_dir, corpus_file=self.data_args.corpus_file,
+                                             query_file=self.data_args.eval_query_file).load_queries()
+
         if self.training_args.debug:
             queries = dict(list(queries.items())[:100])
+            if eval_queries is not None:
+                eval_queries = dict(list(eval_queries.items())[:100])
         start, end = 0, len(queries)
         query_vector, q_mask, q_lookup_indices = self.encode_query(queries, start, end, do_eval=do_eval)
+        eval_query_vector, eval_q_mask, eval_q_lookup_indices = None, None, None
+        if eval_queries is not None:
+            eval_query_vector, eval_q_mask, eval_q_lookup_indices = self.encode_query(
+                eval_queries, 0, len(eval_queries), do_eval=True)
 
         results = {qid: {} for qid in q_lookup_indices}
+        eval_results = {qid: {} for qid in eval_q_lookup_indices} if eval_q_lookup_indices is not None else None
 
         if self.training_args.debug:
             corpus = dict(list(corpus.items())[:1000])
@@ -1576,7 +1779,7 @@ class ReaderTrainer(object):
             num_workers=self.training_args.dataloader_num_workers,
         )
 
-        lookup_indices, batch_scores = [], []
+        lookup_indices, batch_scores, eval_batch_scores = [], [], []
         for bidx, (batch_ids, batch) in enumerate(tqdm(encode_loader)):
             with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 lookup_indices.extend(batch_ids)
@@ -1592,6 +1795,13 @@ class ReaderTrainer(object):
                     else:
                         scores = torch.matmul(query_vector, passage_vector.transpose(0, 1))
                     batch_scores.append(scores)
+                    if eval_query_vector is not None:
+                        if len(eval_query_vector.size()) == 3:
+                            eval_scores = compute_colbert_scores(
+                                eval_query_vector, passage_vector, eval_q_mask, passage_mask)
+                        else:
+                            eval_scores = torch.matmul(eval_query_vector, passage_vector.transpose(0, 1))
+                        eval_batch_scores.append(eval_scores)
 
             if len(batch_scores) % 100 == 0 or bidx == len(encode_loader) - 1:
                 batch_scores = torch.cat(batch_scores, dim=1)
@@ -1616,9 +1826,38 @@ class ReaderTrainer(object):
                     if len(results[qid]) > 100:
                         sorted_indices_scores = sorted(results[qid].items(), key=lambda x: x[1], reverse=True)[:100]
                         results[qid] = {docid: score for docid, score in sorted_indices_scores}
-                lookup_indices, batch_scores = [], []
+                if eval_results is not None:
+                    eval_batch_scores = torch.cat(eval_batch_scores, dim=1)
+                    if eval_batch_scores.size()[0] > 64000:
+                        eval_batch_scores_list = torch.chunk(
+                            eval_batch_scores,
+                            chunks=max(1, eval_batch_scores.size()[0] // 32000),
+                            dim=0,
+                        )
+                        sorted_scores_list, sorted_indices_list = [], []
+                        for batch_scores in eval_batch_scores_list:
+                            sorted_scores, sorted_indices = torch.topk(batch_scores, k=100, dim=-1)
+                            sorted_scores_list.append(sorted_scores)
+                            sorted_indices_list.append(sorted_indices)
+                        sorted_scores = torch.cat(sorted_scores_list, dim=0)
+                        sorted_indices = torch.cat(sorted_indices_list, dim=0)
+                    else:
+                        sorted_scores, sorted_indices = torch.topk(
+                            eval_batch_scores, k=min(100, eval_batch_scores.size(-1)), dim=-1)
+                    sorted_scores = sorted_scores.cpu().numpy().tolist()
+                    sorted_indices = sorted_indices.cpu().numpy().tolist()
+                    for i, (scores, indices) in enumerate(zip(sorted_scores, sorted_indices)):
+                        qid = eval_q_lookup_indices[i]
+                        for score, idx in zip(scores, indices):
+                            docid = lookup_indices[idx]
+                            eval_results[qid][docid] = score
+                        if len(eval_results[qid]) > 100:
+                            sorted_indices_scores = sorted(
+                                eval_results[qid].items(), key=lambda x: x[1], reverse=True)[:100]
+                            eval_results[qid] = {docid: score for docid, score in sorted_indices_scores}
+                lookup_indices, batch_scores, eval_batch_scores = [], [], []
 
-        return results
+        return (results, eval_results) if eval_results is not None else results
 
 
 class ReaderWikidataTrainer(ReaderTrainer):

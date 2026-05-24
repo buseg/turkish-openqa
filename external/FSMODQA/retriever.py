@@ -67,7 +67,12 @@ def write_ranking(corpus_indices, corpus_scores, q_lookup, ranking_save_file, qa
             for qid, q_doc_scores, q_doc_indices in tqdm(zip(q_lookup, corpus_scores, corpus_indices)):
                 score_list = [(s, idx) for s, idx in zip(q_doc_scores, q_doc_indices)]
                 score_list = sorted(score_list, key=lambda x: x[0], reverse=True)
-                f.write(json.dumps({"qid": qid, "pids": [idx for s, idx in score_list[:depth]]}) + '\n')
+                top_scores = score_list[:depth]
+                f.write(json.dumps({
+                    "qid": qid,
+                    "pids": [idx for s, idx in top_scores],
+                    "scores": [float(s) for s, idx in top_scores],
+                }) + '\n')
     else:
         qas = {}
         for question, qid, answers, lang in parse_qa_jsonlines_file(qas_file):

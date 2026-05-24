@@ -130,6 +130,8 @@ class BiEncoderTrainingArguments(TrainingArguments):
     tb_log_examples: int = field(default=0, metadata={"help": "number of generated examples to log to TensorBoard"})
     tb_metric_examples: int = field(default=0, metadata={"help": "number of validation examples for TensorBoard EM/F1"})
     tb_log_generation_steps: int = field(default=0, metadata={"help": "step interval for TensorBoard generations"})
+    local_retriever_eval: bool = field(default=False, metadata={"help": "evaluate retriever on local eval_query_file"})
+    local_retriever_eval_metric: str = field(default="hit@100", metadata={"help": "metric used to select best checkpoint"})
     teacher_temp: float = field(default=1)
     student_temp: float = field(default=1)
 

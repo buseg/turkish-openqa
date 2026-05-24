@@ -3,3 +3,6 @@ odqa_data/
 checkpoint/
 #Ignore python cache files
 __pycache__/
+logs/
+src/knowledge_selector
+.hf_cache/
