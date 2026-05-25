@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
+from tqdm.auto import tqdm
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 torch: Any = None
 
 
@@ -493,20 +494,49 @@ def main() -> None:
         epoch_started_at = time.time()
         model.train()
         losses: list[float] = []
+
         log(f"Starting epoch {epoch + 1}/{args.epochs}")
-        for step, batch in enumerate(loader, start=1):
+
+        progress_bar = tqdm(
+            enumerate(loader, start=1),
+            total=len(loader),
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            leave=True,
+        )
+
+        for step, batch in progress_bar:
             labels = batch.pop("labels").to(device)
             batch = {key: value.to(device) for key, value in batch.items()}
+
             logits = model(**batch).logits.squeeze(-1)
             loss = loss_fn(logits, labels)
+
             loss.backward()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            losses.append(float(loss.detach().cpu()))
-            if step % 100 == 0:
-                log(f"epoch={epoch + 1} step={step}/{len(loader)} recent_loss={mean(losses[-100:]):.4f}")
-        log(f"Finished epoch {epoch + 1}/{args.epochs}: train_loss={mean(losses):.4f} elapsed={time.time() - epoch_started_at:.1f}s")
+
+            loss_value = float(loss.detach().cpu())
+            losses.append(loss_value)
+
+            progress_bar.set_postfix({
+                "loss": f"{loss_value:.4f}",
+                "avg_loss": f"{mean(losses):.4f}",
+            })
+
+            if step % 10000 == 0:
+                log(
+                    f"epoch={epoch + 1} "
+                    f"step={step}/{len(loader)} "
+                    f"recent_loss={mean(losses):.4f}"
+                )
+
+
+        log(
+            f"Finished epoch {epoch + 1}/{args.epochs}: "
+            f"train_loss={mean(losses):.4f} "
+            f"elapsed={time.time() - epoch_started_at:.1f}s"
+        )
 
     log("Step 6/8: scoring eval pairs")
     score_rows(
