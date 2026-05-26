@@ -32,15 +32,17 @@ SELECTOR_MODEL_DIR="${SELECTOR_MODEL_DIR:-${CHECKPOINT_DIR}/neural_knowledge_sel
 SELECTOR_RANKING_FILE="${SELECTOR_RANKING_FILE:-${PIPELINE_DIR}/test_top100_rw_full_selector_reranked.jsonl}"
 
 ADAPTIVE_OUTPUT_DIR="${ADAPTIVE_OUTPUT_DIR:-${PIPELINE_DIR}/adaptive_retrieval}"
-ADAPTIVE_MODEL="${ADAPTIVE_MODEL:-${ROOT_DIR}/checkpoint/adaptive_retrieval/adaptive_retrieval_classifier.pkl}"
-ADAPTIVE_POLICY="${ADAPTIVE_POLICY:-${ROOT_DIR}/checkpoint/adaptive_retrieval/policy.json}"
-ADAPTIVE_MODE="${ADAPTIVE_MODE:-apply}"
+ADAPTIVE_MODEL="${ADAPTIVE_MODEL:-${ADAPTIVE_OUTPUT_DIR}/adaptive_retrieval_classifier.pkl}"
+ADAPTIVE_POLICY="${ADAPTIVE_POLICY:-${ADAPTIVE_OUTPUT_DIR}/policy.json}"
+ADAPTIVE_MODE="${ADAPTIVE_MODE:-train}"
 COMBINED_RANKING_FILE="${COMBINED_RANKING_FILE:-${PIPELINE_DIR}/test_adaptive_combined_rankings.jsonl}"
 RETRIEVAL_METRICS="${RETRIEVAL_METRICS:-${PIPELINE_DIR}/test_adaptive_combined_retrieval_metrics.json}"
 READER_RESULTS_DIR="${READER_RESULTS_DIR:-${PIPELINE_DIR}/reader}"
 
-ADAPTIVE_TRAIN_RANKINGS="${ADAPTIVE_TRAIN_RANKINGS:-${CHECKPOINT_DIR}/train_top100_with_scores.jsonl}"
-ADAPTIVE_VALIDATION_RANKINGS="${ADAPTIVE_VALIDATION_RANKINGS:-${CHECKPOINT_DIR}/validation_top100_with_scores.jsonl}"
+ADAPTIVE_BASE_TRAIN_RANKINGS="${ADAPTIVE_BASE_TRAIN_RANKINGS:-${CHECKPOINT_DIR}/train_top100_with_scores.jsonl}"
+ADAPTIVE_BASE_VALIDATION_RANKINGS="${ADAPTIVE_BASE_VALIDATION_RANKINGS:-${CHECKPOINT_DIR}/validation_top100_with_scores.jsonl}"
+ADAPTIVE_TRAIN_RANKINGS="${ADAPTIVE_TRAIN_RANKINGS:-${PIPELINE_DIR}/train_top100_selector_reranked.jsonl}"
+ADAPTIVE_VALIDATION_RANKINGS="${ADAPTIVE_VALIDATION_RANKINGS:-${PIPELINE_DIR}/validation_top100_selector_reranked.jsonl}"
 ADAPTIVE_TRAIN_QUERIES="${ADAPTIVE_TRAIN_QUERIES:-${TRAIN_DIR}/train.query.jsonl}"
 ADAPTIVE_VALIDATION_QUERIES="${ADAPTIVE_VALIDATION_QUERIES:-${TRAIN_DIR}/validation.query.jsonl}"
 
@@ -68,6 +70,7 @@ MATCH_MODE="${MATCH_MODE:-squad-prefix}"
 
 SKIP_LLM="${SKIP_LLM:-0}"
 SKIP_SELECTOR="${SKIP_SELECTOR:-0}"
+SKIP_ADAPTIVE_TRAINVAL_SELECTOR="${SKIP_ADAPTIVE_TRAINVAL_SELECTOR:-0}"
 SKIP_ADAPTIVE="${SKIP_ADAPTIVE:-0}"
 SKIP_RETRIEVAL_EVAL="${SKIP_RETRIEVAL_EVAL:-0}"
 SKIP_READER="${SKIP_READER:-0}"
@@ -130,6 +133,43 @@ if [[ "${SKIP_SELECTOR}" != "1" ]]; then
   CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${selector_cmd[@]}"
 else
   echo "==> Skipping selector; using ${SELECTOR_RANKING_FILE}"
+fi
+
+if [[ "${SKIP_ADAPTIVE}" != "1" && "${ADAPTIVE_MODE}" == "train" && "${SKIP_ADAPTIVE_TRAINVAL_SELECTOR}" != "1" ]]; then
+  echo "==> Preparing adaptive train/validation rankings with saved knowledge selector"
+  adaptive_train_selector_cmd=(
+    "${FSMODQA_PYTHON_BIN}" "${ROOT_DIR}/src/apply_fsmodqa_neural_selector.py"
+    --model-dir "${SELECTOR_MODEL_DIR}"
+    --ranking "${ADAPTIVE_BASE_TRAIN_RANKINGS}"
+    --queries "${ADAPTIVE_TRAIN_QUERIES}"
+    --corpus "${CORPUS_FILE}"
+    --output "${ADAPTIVE_TRAIN_RANKINGS}"
+    --n-context "${SELECTOR_N_CONTEXT}"
+    --eval-batch-size "${SELECTOR_EVAL_BATCH_SIZE}"
+    --max-length "${SELECTOR_MAX_LENGTH}"
+  )
+  if [[ -n "${SELECTOR_WEIGHT}" ]]; then
+    adaptive_train_selector_cmd+=(--selector-weight "${SELECTOR_WEIGHT}")
+  fi
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${adaptive_train_selector_cmd[@]}"
+
+  adaptive_validation_selector_cmd=(
+    "${FSMODQA_PYTHON_BIN}" "${ROOT_DIR}/src/apply_fsmodqa_neural_selector.py"
+    --model-dir "${SELECTOR_MODEL_DIR}"
+    --ranking "${ADAPTIVE_BASE_VALIDATION_RANKINGS}"
+    --queries "${ADAPTIVE_VALIDATION_QUERIES}"
+    --corpus "${CORPUS_FILE}"
+    --output "${ADAPTIVE_VALIDATION_RANKINGS}"
+    --n-context "${SELECTOR_N_CONTEXT}"
+    --eval-batch-size "${SELECTOR_EVAL_BATCH_SIZE}"
+    --max-length "${SELECTOR_MAX_LENGTH}"
+  )
+  if [[ -n "${SELECTOR_WEIGHT}" ]]; then
+    adaptive_validation_selector_cmd+=(--selector-weight "${SELECTOR_WEIGHT}")
+  fi
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${adaptive_validation_selector_cmd[@]}"
+else
+  echo "==> Skipping adaptive train/validation selector preparation"
 fi
 
 if [[ "${SKIP_ADAPTIVE}" != "1" ]]; then
@@ -195,6 +235,10 @@ echo "LLM ranking: ${LLM_RANKING_FILE}"
 echo "Selector ranking: ${SELECTOR_RANKING_FILE}"
 echo "Adaptive dir: ${ADAPTIVE_OUTPUT_DIR}"
 echo "Adaptive mode: ${ADAPTIVE_MODE}"
+echo "Adaptive base train ranking: ${ADAPTIVE_BASE_TRAIN_RANKINGS}"
+echo "Adaptive base validation ranking: ${ADAPTIVE_BASE_VALIDATION_RANKINGS}"
+echo "Adaptive train ranking: ${ADAPTIVE_TRAIN_RANKINGS}"
+echo "Adaptive validation ranking: ${ADAPTIVE_VALIDATION_RANKINGS}"
 echo "Adaptive model: ${ADAPTIVE_MODEL}"
 echo "Adaptive policy: ${ADAPTIVE_POLICY}"
 echo "Combined ranking: ${COMBINED_RANKING_FILE}"

@@ -6,13 +6,17 @@ This repository contains the steps to prepare data, encode the corpus and querie
 
 ## Setup
 
-1. Create the knowledge source and preprocess the Squad TR. Use the odqa environment for the kernel and run the Jupyter Notebook `download_data.ipynb`:
+1. Create the environments:
 
 ```bash
+conda env create -f odqa_environment.yml
 conda env create -f fsmodqa_environment.yml
+conda env create -f fsmodqa_gemma_environment.yml
 ```
 
-2. Prepare retriever inputs:
+2. Create the knowledge source and preprocess the Squad TR. Use the odqa environment for the kernel and run the Jupyter Notebook `download_data.ipynb`.
+
+3. Prepare retriever inputs:
 
 ```bash
 python src/prepare_fsmodqa_retrieval_inputs.py
@@ -25,14 +29,14 @@ Set up the fsmodqa_env
 ```bash
 mkdir -p checkpoint/fsmodqa_off_the_shelf/encoding
 cd external/FSMODQA
-conda env create -f fsmodqa_environment.yml
+conda env create -f ../../fsmodqa_environment.yml
 ```
 
 
 Encode the corpus in 8 shards:
 ```bash
 for i in 0 1 2 3 4 5 6 7; do
-  CUDA_VISIBLE_DEVICES=0 python encode.py \
+  CUDA_VISIBLE_DEVICES=1 python encode.py \
     --model_name_or_path fanjiang98/FSMODQA-100k \
     --output_dir ../../checkpoint/fsmodqa_off_the_shelf \
     --train_dir ../../odqa_data/fsmodqa_retrieval \
@@ -105,7 +109,7 @@ Run FAISS GPU retrieval top-100:
 ```bash
 cd external/FSMODQA
 
-CUDA_VISIBLE_DEVICES=0 python retriever.py \
+CUDA_VISIBLE_DEVICES=1 python retriever.py \
   --query_embeddings ../../checkpoint/fsmodqa_off_the_shelf/encoding/validation_query_embedding.pt \
   --passage_embeddings '../../checkpoint/fsmodqa_off_the_shelf/encoding/passage_embedding_split*.pt' \
   --depth 100 \
@@ -200,8 +204,14 @@ CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 \
 
 ## Question Rewrite
 
+Use `fsmodqa_gemma` for the Gemma rewrite model:
+
+```bash
+conda activate fsmodqa_gemma
 ```
-CUDA_VISIBLE_DEVICES=2 python src/llm_expand_retrieve.py \
+
+```
+CUDA_VISIBLE_DEVICES=1 python src/llm_expand_retrieve.py \
   --input-query-file odqa_data/fsmodqa_retrieval/test.query.jsonl \
   --output-ranking checkpoint/llm_expand_smoke/test_top10_rw_full.jsonl \
   --work-dir checkpoint/llm_expand_smoke/work_one \
@@ -221,9 +231,25 @@ CUDA_VISIBLE_DEVICES=2 python src/llm_expand_retrieve.py \
 ## Knowledge Selector
 
 ```
-python src/knowledge_selector/train_fsmodqa_neural_selector.py \
+CUDA_VISIBLE_DEVICES=1 python src/knowledge_selector/train_fsmodqa_neural_selector.py \
   --train-ranking checkpoint/final_fsmodqa_squad_tr_full_deavg/train_top100_with_scores.jsonl \
   --eval-ranking checkpoint/final_fsmodqa_squad_tr_full_deavg/validation_top100_with_scores.jsonl \
   --output-dir checkpoint/final_fsmodqa_squad_tr_full_deavg/neural_knowledge_selector \
   --write-eval-reranked checkpoint/final_fsmodqa_squad_tr_full_deavg/validation_top100_selector_reranked.jsonl
+```
+
+## Adaptive Retrieval
+
+```
+CUDA_VISIBLE_DEVICES=1 python src/train_adaptive_retrieval.py \
+  --easy-options 5,10,15,20,25   \
+  --medium-options 25,40,50,75   \
+  --hard-options 100   \
+  --min-recall-ratio 0.96
+```
+
+## All Extensions
+
+```
+bash scripts/run_full_pipeline_llm_selector_adaptive.sh
 ```
